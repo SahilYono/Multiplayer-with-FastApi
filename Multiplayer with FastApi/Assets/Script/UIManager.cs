@@ -1,31 +1,48 @@
 ﻿// UIManager.cs
-// Attach to the Canvas GameObject.
+// ONE instance per player.
+// Each player has their own connect panel and connect button.
+// Attach to the Canvas (or a child panel).
 
 using UnityEngine;
 using UnityEngine.UI;
 
 public class UIManager : MonoBehaviour
 {
-    [Header("Room Panel (shown before game)")]
-    public GameObject roomPanel;
-    public InputField ipInput;        // server IP field
-    public InputField roomInput;      // room ID field
-    public InputField playerIDInput;  // player1 or player2
+    // ── Set in Inspector ──────────────────────────────────────────
+    public int playerIndex = 0;   // 0 = Player1,  1 = Player2
+
+    [Header("Panels")]
+    public GameObject connectPanel;   // shown before connecting
+    public GameObject gamePanel;      // shown after connecting
+
+    [Header("Connect Panel Inputs")]
+    public InputField ipInput;
+    public InputField roomInput;
+    public InputField playerIDInput;
     public Button connectButton;
 
-    [Header("Game Panel (shown during game)")]
-    public GameObject gamePanel;
+    [Header("Network Manager for this player")]
+    public NetworkManager networkManager;
 
     void Start()
     {
-        // Show room panel first, hide game panel
-        roomPanel.SetActive(true);
+        // Show connect panel, hide game panel
+        connectPanel.SetActive(true);
         gamePanel.SetActive(false);
 
-        // Pre-fill defaults so testing is faster
-        ipInput.text = "10.201.31.104";   // ← change to your PC's IP
-        roomInput.text = "ROOM42";
-        playerIDInput.text = "player1";       // player2 on second device
+        // Pre-fill sensible defaults
+        ipInput.text = "127.0.0.1";           // localhost — same machine
+        roomInput.text = "ROOM1";
+
+        if (playerIndex == 0)
+        {
+            playerIDInput.text = "player1";
+        }
+        else
+        {
+            playerIDInput.text = "player2";
+            // Player 2 defaults to a different position in the input
+        }
 
         connectButton.onClick.AddListener(OnConnectClicked);
     }
@@ -36,17 +53,30 @@ public class UIManager : MonoBehaviour
         string room = roomInput.text.Trim().ToUpper();
         string pid = playerIDInput.text.Trim().ToLower();
 
-        if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(room) || string.IsNullOrEmpty(pid))
+        // Validate
+        if (string.IsNullOrEmpty(ip))
         {
-            Debug.LogWarning("Fill in all fields!");
+            Debug.LogWarning($"[UI{playerIndex}] IP is empty!");
+            return;
+        }
+        if (string.IsNullOrEmpty(room))
+        {
+            Debug.LogWarning($"[UI{playerIndex}] Room ID is empty!");
+            return;
+        }
+        if (string.IsNullOrEmpty(pid))
+        {
+            Debug.LogWarning($"[UI{playerIndex}] Player ID is empty!");
             return;
         }
 
+        Debug.Log($"[UI{playerIndex}] Connecting as {pid} to room {room} at {ip}");
+
         // Switch panels
-        roomPanel.SetActive(false);
+        connectPanel.SetActive(false);
         gamePanel.SetActive(true);
 
-        // Tell NetworkManager to connect
-        NetworkManager.Instance.Connect(ip, room, pid);
+        // Connect
+        networkManager.Connect(ip, room, pid);
     }
 }

@@ -1,22 +1,42 @@
 ﻿// PlayerController.cs
-// Attach this to the LocalPlayer GameObject.
+// Attach to the LOCAL player capsule (LocalPlayer1 or LocalPlayer2)
+//
+// Player 1 controls: WASD to move, Space to attack
+// Player 2 controls: Arrow Keys to move, Enter/Return to attack
+// This way both players work independently in the SAME Unity window.
 
 using UnityEngine;
 
 public class PlayerController : MonoBehaviour
 {
+    // ── Set in Inspector ──────────────────────────────────────────
+    // 0 = Player 1 (uses WASD + Space)
+    // 1 = Player 2 (uses Arrow Keys + Enter)
+    public int playerIndex = 0;
+
     public float moveSpeed = 5f;
 
-    // How often to send position to server (every 0.05s = 20 times/sec)
-    float sendInterval = 0.05f;
-    float sendTimer = 0f;
+    // ── Reference to THIS player's NetworkManager ──────────────────
+    public NetworkManager networkManager;
 
-    // Track last sent position to avoid sending duplicates
-    Vector3 lastSentPosition;
+    // ── Internal state ─────────────────────────────────────────────
+    float sendTimer = 0f;
+    float sendInterval = 0.05f;   // send position 20x per second
+    Vector3 lastSentPos;
     float lastSentRotY;
+
+    bool gameActive = false;   // only send data after game starts
+
+    public void SetGameActive(bool active)
+    {
+        gameActive = active;
+    }
 
     void Update()
     {
+        if (!gameActive) return;
+        if (networkManager == null || !networkManager.connected) return;
+
         HandleMovement();
         HandleAttack();
         HandlePositionSync();
@@ -24,48 +44,83 @@ public class PlayerController : MonoBehaviour
 
     void HandleMovement()
     {
-        // Read WASD / Arrow keys
-        float h = Input.GetAxis("Horizontal");  // A/D keys → left/right
-        float v = Input.GetAxis("Vertical");    // W/S keys → forward/back
+        float h = 0f;
+        float v = 0f;
 
-        // Build movement vector — we ignore Y axis (no flying)
-        Vector3 move = new Vector3(h, 0, v) * moveSpeed * Time.deltaTime;
-        transform.Translate(move, Space.World);
+        if (playerIndex == 0)
+        {
+            // Player 1: WASD
+            if (Input.GetKey(KeyCode.W)) v = 1f;
+            if (Input.GetKey(KeyCode.S)) v = -1f;
+            if (Input.GetKey(KeyCode.A)) h = -1f;
+            if (Input.GetKey(KeyCode.D)) h = 1f;
+        }
+        else
+        {
+            // Player 2: Arrow Keys
+            if (Input.GetKey(KeyCode.UpArrow)) v = 1f;
+            if (Input.GetKey(KeyCode.DownArrow)) v = -1f;
+            if (Input.GetKey(KeyCode.LeftArrow)) h = -1f;
+            if (Input.GetKey(KeyCode.RightArrow)) h = 1f;
+        }
 
-        // Rotate character to face movement direction
-        if (move.magnitude > 0.01f)
-            transform.LookAt(transform.position + move);
+        Vector3 dir = new Vector3(h, 0f, v).normalized;
+
+        if (dir.magnitude > 0.01f)
+        {
+            transform.Translate(dir * moveSpeed * Time.deltaTime, Space.World);
+            transform.rotation = Quaternion.LookRotation(dir);
+        }
+
+        // Keep player on the ground plane (y stays at 1)
+        Vector3 pos = transform.position;
+        pos.y = 1f;
+        transform.position = pos;
     }
 
     void HandleAttack()
     {
-        // Space bar = attack
-        if (Input.GetKeyDown(KeyCode.Space))
-        {
-            Debug.Log("Attack sent!");
-            // Tell the server — server will check if it hit
-            NetworkManager.Instance.SendAttack();
+        bool attacked = false;
 
-            // Optional: play an animation here (not required for the task)
+        if (playerIndex == 0 && Input.GetKeyDown(KeyCode.Space))
+            attacked = true;
+
+        if (playerIndex == 1 && (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter)))
+            attacked = true;
+
+        if (attacked)
+        {
+            networkManager.SendAttack();
+            // Flash the capsule briefly to show attack visually
+            StartCoroutine(FlashAttack());
         }
+    }
+
+    System.Collections.IEnumerator FlashAttack()
+    {
+        var rend = GetComponent<Renderer>();
+        if (rend == null) yield break;
+
+        Color original = rend.material.color;
+        rend.material.color = Color.yellow;
+        yield return new WaitForSeconds(0.15f);
+        rend.material.color = original;
     }
 
     void HandlePositionSync()
     {
-        // Don't send every single frame — that's too much data.
-        // Send at a fixed interval (20 times/second is smooth enough).
         sendTimer += Time.deltaTime;
         if (sendTimer < sendInterval) return;
         sendTimer = 0f;
 
-        // Only send if position actually changed (saves bandwidth)
-        if (transform.position == lastSentPosition &&
+        // Only send if actually moved
+        if (transform.position == lastSentPos &&
             transform.eulerAngles.y == lastSentRotY)
             return;
 
-        lastSentPosition = transform.position;
+        lastSentPos = transform.position;
         lastSentRotY = transform.eulerAngles.y;
 
-        NetworkManager.Instance.SendMove(transform.position, transform.eulerAngles.y);
+        networkManager.SendMove(transform.position, transform.eulerAngles.y);
     }
 }

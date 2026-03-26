@@ -1,90 +1,93 @@
 ﻿// NetworkManager.cs
-// Attach this to an empty GameObject called "NetworkManager" in the scene.
-// This is the single point of contact with the FastAPI server.
+// Attach to an empty GameObject called "NetworkManager"
+// Handles ALL WebSocket communication with the FastAPI server.
+// Supports TWO instances running in the same scene (Player1 + Player2)
 
 using System;
-using System.Collections.Generic;
 using UnityEngine;
-using NativeWebSocket;          // the package we installed
+using NativeWebSocket;
 
 public class NetworkManager : MonoBehaviour
 {
-    // Static instance so ANY script can call NetworkManager.Instance.Send(...)
-    public static NetworkManager Instance;
+    // ── Which player is this instance? Set in Inspector ──────────
+    // 0 = Player 1 (left side)   1 = Player 2 (right side)
+    public int playerIndex = 0;
 
-    WebSocket ws;               // the actual WebSocket connection object
+    // ── Static references so other scripts can find each instance ─
+    public static NetworkManager Player1;
+    public static NetworkManager Player2;
 
-    // These are set from the UI before connecting
-    [HideInInspector] public string serverIP = "192.168.1.5";   // your PC's local IP
-    [HideInInspector] public string roomID = "ROOM42";
-    [HideInInspector] public string playerID = "player1";       // unique per device
+    // ── Connection state (read by UIManager / GameManager) ────────
+    [HideInInspector] public string playerID = "";
+    [HideInInspector] public bool connected = false;
+    [HideInInspector] public string statusMsg = "Not connected";
 
-    // Other scripts subscribe to these events to react to server messages
-    public event Action<Dictionary<string, object>> OnMessageReceived;
+    // ── The WebSocket connection ───────────────────────────────────
+    WebSocket ws;
+
+    // ── GameManager that belongs to THIS player ────────────────────
+    // Drag the correct GameManager in Inspector
+    public GameManager myGameManager;
 
     void Awake()
     {
-        // Singleton pattern: only one NetworkManager should exist
-        if (Instance == null) Instance = this;
-        else Destroy(gameObject);
+        // Register as Player1 or Player2 static reference
+        if (playerIndex == 0) Player1 = this;
+        else Player2 = this;
     }
 
-    // Called from UIManager when the player clicks "Connect"
+    // Called by UIManager when the player clicks Connect
     public async void Connect(string ip, string room, string pid)
     {
-        serverIP = ip;
-        roomID = room;
-        playerID = pid;
+        if (ws != null && ws.State == WebSocketState.Open)
+        {
+            Debug.LogWarning($"[NM{playerIndex}] Already connected!");
+            return;
+        }
 
-        // Build the WebSocket URL.
-        // Format: ws://SERVER_IP:8000/ws/ROOM_ID/PLAYER_ID
-        string url = $"ws://{serverIP}:8000/ws/{roomID}/{playerID}";
-        Debug.Log($"Connecting to: {url}");
+        playerID = pid;
+        connected = false;
+        statusMsg = "Connecting...";
+
+        string url = $"ws://{ip}:8000/ws/{room}/{pid}";
+        Debug.Log($"[NM{playerIndex}] Connecting to: {url}");
 
         ws = new WebSocket(url);
 
-        // ── EVENT: Connection opened ──────────────────────────────
-        ws.OnOpen += () => {
-            Debug.Log("WebSocket connected!");
+        ws.OnOpen += () =>
+        {
+            connected = true;
+            statusMsg = "Connected — waiting for opponent...";
+            Debug.Log($"[NM{playerIndex}] WebSocket OPEN");
         };
 
-        // ── EVENT: Message received from server ───────────────────
-        // All game logic reacts here — positions, hits, scores, game state.
-        ws.OnMessage += (bytes) => {
+        ws.OnMessage += (bytes) =>
+        {
             string json = System.Text.Encoding.UTF8.GetString(bytes);
-            Debug.Log($"Server says: {json}");
-
-            // Parse JSON → Dictionary
-            var msg = JsonUtility.FromJson<ServerMessage>(json);
-
-            // Convert to generic dict so GameManager can read any field
-            var data = new Dictionary<string, object> {
-                { "type", msg.type }
-            };
-            // Fire the event — GameManager listens to this
-            OnMessageReceived?.Invoke(data);
-
-            // Better: use a full JSON parser (MiniJSON or Newtonsoft)
-            // For simplicity here we pass the raw JSON to GameManager too
-            GameManager.Instance.HandleServerMessage(json);
+            Debug.Log($"[NM{playerIndex}] MSG: {json}");
+            // Forward to THIS player's GameManager
+            if (myGameManager != null)
+                myGameManager.HandleServerMessage(json);
         };
 
-        // ── EVENT: Connection closed ──────────────────────────────
-        ws.OnClose += (code) => {
-            Debug.Log($"WebSocket closed: {code}");
+        ws.OnError += (err) =>
+        {
+            statusMsg = "Error: " + err;
+            Debug.LogError($"[NM{playerIndex}] ERROR: {err}");
         };
 
-        // ── EVENT: Error ──────────────────────────────────────────
-        ws.OnError += (err) => {
-            Debug.LogError($"WebSocket error: {err}");
+        ws.OnClose += (code) =>
+        {
+            connected = false;
+            statusMsg = "Disconnected (" + code + ")";
+            Debug.Log($"[NM{playerIndex}] CLOSED: {code}");
         };
 
-        // Actually open the connection
         await ws.Connect();
     }
 
-    // Call this every frame — NativeWebSocket needs this to dispatch messages
-    // on the Unity main thread (otherwise you can't touch GameObjects safely)
+    // Unity calls this every frame — NativeWebSocket NEEDS this
+    // to safely deliver messages on the main thread
     void Update()
     {
 #if !UNITY_WEBGL || UNITY_EDITOR
@@ -92,39 +95,53 @@ public class NetworkManager : MonoBehaviour
 #endif
     }
 
-    // ── SEND HELPERS ──────────────────────────────────────────────
-    // PlayerController calls these to tell the server what happened.
-
-    public async void SendMove(Vector3 position, float rotY)
+    // ── SEND: player moved ─────────────────────────────────────────
+    public async void SendMove(Vector3 pos, float rotY)
     {
-        if (ws == null || ws.State != WebSocketState.Open) return;
+        if (!IsReady()) return;
 
-        // Build the message as a simple JSON string
-        string msg = $"{{" +
-            $"\"type\":\"move\"," +
-            $"\"position\":{{\"x\":{position.x:F3},\"y\":{position.y:F3},\"z\":{position.z:F3}}}," +
-            $"\"rotation\":{{\"y\":{rotY:F3}}}" +
-            $"}}";
+        // Use InvariantCulture so decimals always use "." not "," (locale safe)
+        string px = pos.x.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+        string py = pos.y.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+        string pz = pos.z.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+        string ry = rotY.ToString("F3", System.Globalization.CultureInfo.InvariantCulture);
+
+        string msg = "{\"type\":\"move\","
+                   + "\"position\":{\"x\":" + px + ",\"y\":" + py + ",\"z\":" + pz + "},"
+                   + "\"rotation\":{\"y\":" + ry + "}}";
 
         await ws.SendText(msg);
     }
 
+    // ── SEND: player attacked ──────────────────────────────────────
     public async void SendAttack()
     {
-        if (ws == null || ws.State != WebSocketState.Open) return;
+        if (!IsReady()) return;
+        Debug.Log($"[NM{playerIndex}] Sending attack");
         await ws.SendText("{\"type\":\"attack\"}");
     }
 
-    // Close connection cleanly when the app quits
+    // ── SEND: restart request ──────────────────────────────────────
+    public async void SendRestart()
+    {
+        if (!IsReady()) return;
+        await ws.SendText("{\"type\":\"restart\"}");
+    }
+
+    bool IsReady()
+    {
+        return ws != null && ws.State == WebSocketState.Open;
+    }
+
     async void OnApplicationQuit()
     {
-        if (ws != null) await ws.Close();
+        if (ws != null && ws.State == WebSocketState.Open)
+            await ws.Close();
     }
-}
 
-// Simple class to deserialize just the "type" field of server messages
-[Serializable]
-public class ServerMessage
-{
-    public string type;
+    async void OnDestroy()
+    {
+        if (ws != null && ws.State == WebSocketState.Open)
+            await ws.Close();
+    }
 }

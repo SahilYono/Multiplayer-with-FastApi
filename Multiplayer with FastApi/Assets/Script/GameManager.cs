@@ -1,158 +1,228 @@
-﻿using UnityEngine;
+﻿// GameManager.cs
+// ONE instance per player.
+// GameManager1 handles messages for Player 1.
+// GameManager2 handles messages for Player 2.
+//
+// Attach to an empty GameObject. Wire up references in Inspector.
+
+using UnityEngine;
 using UnityEngine.UI;
 
 public class GameManager : MonoBehaviour
 {
-    public static GameManager Instance;
+    // ── Set in Inspector ──────────────────────────────────────────
+    public int playerIndex = 0;   // 0 = Player1's GM,  1 = Player2's GM
 
-    public Transform remotePlayer;
-    public Text statusText;
-    public Text scoreText;
+    [Header("This player's objects")]
+    public PlayerController myPlayerController;   // LocalPlayer1 or LocalPlayer2
+    public Transform remotePlayerTransform; // the OTHER player's capsule
 
+    [Header("This player's UI")]
+    public Text statusText;   // shows game status
+    public Text scoreText;    // shows scores
+    public Text controlsText; // shows control hint
+
+    // ── Internal state ─────────────────────────────────────────────
+    string myID = "";
     int myScore = 0;
     int theirScore = 0;
 
-    // Target position for smooth movement
-    Vector3 remoteTargetPos;
-    Quaternion remoteTargetRot;
-
-    void Awake()
-    {
-        if (Instance == null) Instance = this;
-        else Destroy(gameObject);
-    }
-
     void Start()
     {
-        // Initialize target to current position
-        if (remotePlayer != null)
+        // Show the correct controls hint
+        if (controlsText != null)
         {
-            remoteTargetPos = remotePlayer.position;
-            remoteTargetRot = remotePlayer.rotation;
+            if (playerIndex == 0)
+                controlsText.text = "P1: WASD move | Space attack";
+            else
+                controlsText.text = "P2: Arrows move | Enter attack";
         }
+
+        SetStatus("Enter details and click Connect");
+        UpdateScoreDisplay();
     }
 
-    void Update()
-    {
-        // Smoothly move remote player every frame toward target
-        // This makes movement look smooth even if updates come 20x/sec
-        if (remotePlayer != null)
-        {
-            remotePlayer.position = Vector3.Lerp(
-                remotePlayer.position, remoteTargetPos, Time.deltaTime * 15f);
-            remotePlayer.rotation = Quaternion.Lerp(
-                remotePlayer.rotation, remoteTargetRot, Time.deltaTime * 15f);
-        }
-    }
-
+    // ── Called by NetworkManager when a message arrives ────────────
     public void HandleServerMessage(string json)
     {
-        Debug.Log("[GameManager received]: " + json);
+        // We manually check what type of message it is
+        // and act accordingly. No external JSON library needed.
 
-        if (json.Contains("\"type\":\"game_start\""))
+        string type = ExtractString(json, "\"type\":\"", "\"");
+
+        switch (type)
         {
-            SetStatus("GAME ON! WASD = move | Space = attack");
-        }
+            case "game_start":
+                myID = ExtractString(json, "\"your_id\":\"", "\"");
+                myScore = 0;
+                theirScore = 0;
+                UpdateScoreDisplay();
+                SetStatus("GAME ON! First to 5 hits wins!");
+                // Tell PlayerController it can start
+                if (myPlayerController != null)
+                    myPlayerController.SetGameActive(true);
+                break;
 
-        else if (json.Contains("\"type\":\"player_joined\""))
-        {
-            if (json.Contains("\"count\":2"))
-                SetStatus("Both players in. Starting...");
-            else
-                SetStatus("Waiting for second player...");
-        }
+            case "player_joined":
+                string count = ExtractString(json, "\"count\":", ",");
+                if (count == "") count = ExtractString(json, "\"count\":", "}");
+                if (count.Trim() == "1")
+                    SetStatus("Waiting for second player...");
+                else
+                    SetStatus("Both players joined!");
+                break;
 
-        else if (json.Contains("\"type\":\"player_moved\""))
-        {
-            // Parse the position block specifically
-            // JSON looks like: ..."position":{"x":1.23,"y":1.0,"z":0.5},"rotation":{"y":45.0}
-            int posStart = json.IndexOf("\"position\":{");
-            int rotStart = json.IndexOf("\"rotation\":{");
+            case "player_moved":
+                // Move the remote player's capsule
+                float x = ExtractFloat(json, "\"x\":");
+                float y = ExtractFloat(json, "\"y\":");
+                float z = ExtractFloat(json, "\"z\":");
+                float ry = ExtractFloat(json, "\"rotation\":{\"y\":");
 
-            if (posStart >= 0 && remotePlayer != null)
-            {
-                // Get the substring just for position block: {"x":1.23,"y":1.0,"z":0.5}
-                string posSub = json.Substring(posStart + 11); // skip "position":{
-                float x = ParseKeyFloat(posSub, "\"x\":");
-                float y = ParseKeyFloat(posSub, "\"y\":");
-                float z = ParseKeyFloat(posSub, "\"z\":");
+                if (remotePlayerTransform != null)
+                {
+                    // Smooth interpolation so movement doesn't look jerky
+                    remotePlayerTransform.position = Vector3.Lerp(
+                        remotePlayerTransform.position,
+                        new Vector3(x, y, z),
+                        0.6f
+                    );
+                    remotePlayerTransform.rotation = Quaternion.Lerp(
+                        remotePlayerTransform.rotation,
+                        Quaternion.Euler(0, ry, 0),
+                        0.6f
+                    );
+                }
+                break;
 
-                remoteTargetPos = new Vector3(x, y, z);
-            }
+            case "hit":
+                string attacker = ExtractString(json, "\"attacker\":\"", "\"");
+                string victim = ExtractString(json, "\"victim\":\"", "\"");
 
-            if (rotStart >= 0 && remotePlayer != null)
-            {
-                string rotSub = json.Substring(rotStart + 11);
-                float ry = ParseKeyFloat(rotSub, "\"y\":");
-                remoteTargetRot = Quaternion.Euler(0, ry, 0);
-            }
-        }
+                if (attacker == myID)
+                {
+                    myScore++;
+                    SetStatus("YOUR HIT! +" + myScore);
+                    FlashStatus(Color.green);
+                }
+                else if (victim == myID)
+                {
+                    theirScore++;
+                    SetStatus("Got hit! Dodge!");
+                    FlashStatus(Color.red);
+                }
 
-        else if (json.Contains("\"type\":\"hit\""))
-        {
-            string me = NetworkManager.Instance.playerID;
+                UpdateScoreDisplay();
+                break;
 
-            if (json.Contains("\"attacker\":\"" + me + "\""))
-            {
-                myScore++;
-                SetStatus("YOU HIT THEM!");
-            }
-            else
-            {
-                theirScore++;
-                SetStatus("You got hit!");
-            }
+            case "miss":
+                float dist = ExtractFloat(json, "\"dist\":");
+                SetStatus($"Miss! Too far ({dist:F1} units). Get closer!");
+                break;
 
-            if (scoreText != null)
-                scoreText.text = "You: " + myScore + "  |  Them: " + theirScore;
-        }
+            case "game_over":
+                string winner = ExtractString(json, "\"winner\":\"", "\"");
+                if (winner == myID)
+                    SetStatus("=== YOU WIN! === Press R to restart");
+                else
+                    SetStatus("=== You lose === Press R to restart");
 
-        else if (json.Contains("\"type\":\"game_over\""))
-        {
-            string me = NetworkManager.Instance.playerID;
-            if (json.Contains("\"winner\":\"" + me + "\""))
-                SetStatus("=== YOU WIN! ===");
-            else
-                SetStatus("=== You lose. GG ===");
-        }
+                if (myPlayerController != null)
+                    myPlayerController.SetGameActive(false);
+                break;
 
-        else if (json.Contains("\"type\":\"player_left\""))
-        {
-            SetStatus("Other player disconnected.");
-        }
+            case "game_restart":
+                myScore = 0;
+                theirScore = 0;
+                UpdateScoreDisplay();
+                SetStatus("RESTARTED! WASD move, Space/Enter attack");
+                if (myPlayerController != null)
+                    myPlayerController.SetGameActive(true);
+                break;
 
-        else if (json.Contains("\"type\":\"error\""))
-        {
-            SetStatus("Error: Room is full!");
+            case "player_left":
+                SetStatus("Other player left the game.");
+                if (myPlayerController != null)
+                    myPlayerController.SetGameActive(false);
+                break;
+
+            case "error":
+                string errMsg = ExtractString(json, "\"msg\":\"", "\"");
+                SetStatus("Error: " + errMsg);
+                break;
+
+            default:
+                Debug.Log($"[GM{playerIndex}] Unknown message type: {type}");
+                break;
         }
     }
 
+    // ── Restart key ────────────────────────────────────────────────
+    void Update()
+    {
+        // Player 1 presses R to request restart
+        if (playerIndex == 0 && Input.GetKeyDown(KeyCode.R))
+        {
+            if (NetworkManager.Player1 != null)
+                NetworkManager.Player1.SendRestart();
+        }
+    }
+
+    // ── UI helpers ─────────────────────────────────────────────────
     void SetStatus(string msg)
     {
-        if (statusText != null) statusText.text = msg;
-        Debug.Log("[Status] " + msg);
+        if (statusText != null)
+            statusText.text = msg;
+        Debug.Log($"[GM{playerIndex}] {msg}");
     }
 
-    // Finds a float value right after a key in a substring
-    // Much safer because you pass in the right section of JSON
-    float ParseKeyFloat(string sub, string key)
+    void UpdateScoreDisplay()
     {
-        int i = sub.IndexOf(key);
-        if (i < 0) return 0f;
+        if (scoreText != null)
+            scoreText.text = $"You: {myScore}  |  Them: {theirScore}";
+    }
 
+    Coroutine flashCoroutine;
+    void FlashStatus(Color col)
+    {
+        if (statusText == null) return;
+        if (flashCoroutine != null) StopCoroutine(flashCoroutine);
+        flashCoroutine = StartCoroutine(DoFlash(col));
+    }
+
+    System.Collections.IEnumerator DoFlash(Color col)
+    {
+        statusText.color = col;
+        yield return new WaitForSeconds(0.4f);
+        statusText.color = Color.white;
+    }
+
+    // ── JSON helpers ───────────────────────────────────────────────
+    // Extracts a string value from JSON: finds key, reads until endChar
+    string ExtractString(string json, string key, string endChar)
+    {
+        int i = json.IndexOf(key);
+        if (i < 0) return "";
+        int start = i + key.Length;
+        int end = json.IndexOf(endChar, start);
+        if (end < 0) return json.Substring(start);
+        return json.Substring(start, end - start);
+    }
+
+    // Extracts a float value from JSON: finds key, reads numeric chars
+    float ExtractFloat(string json, string key)
+    {
+        int i = json.IndexOf(key);
+        if (i < 0) return 0f;
         int s = i + key.Length;
         int e = s;
-
-        while (e < sub.Length &&
-               (char.IsDigit(sub[e]) || sub[e] == '.' || sub[e] == '-'))
+        while (e < json.Length &&
+               (char.IsDigit(json[e]) || json[e] == '.' || json[e] == '-'))
             e++;
-
-        if (e > s && float.TryParse(sub.Substring(s, e - s),
+        return float.TryParse(
+            json.Substring(s, e - s),
             System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture,
-            out float val))
-            return val;
-
-        return 0f;
+            out float v) ? v : 0f;
     }
 }
