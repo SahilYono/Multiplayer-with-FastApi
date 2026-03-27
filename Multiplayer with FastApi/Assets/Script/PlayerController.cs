@@ -1,126 +1,116 @@
-﻿// PlayerController.cs
-// Attach to the LOCAL player capsule (LocalPlayer1 or LocalPlayer2)
-//
-// Player 1 controls: WASD to move, Space to attack
-// Player 2 controls: Arrow Keys to move, Enter/Return to attack
-// This way both players work independently in the SAME Unity window.
+﻿/*
+ * PlayerController.cs
+ * ────────────────────
+ * Handles LOCAL player:
+ *   - WASD / Arrow key movement
+ *   - Sends position to server every 50ms (20 times/sec)
+ *   - Camera follows this player
+ *
+ * SETUP:
+ *   - Attach to LocalPlayerPrefab (Blue Capsule)
+ *   - Requires CharacterController component on same GameObject
+ *   - Disable this script by default; GameManager enables it on game start
+ */
 
 using UnityEngine;
 
 public class PlayerController : MonoBehaviour
 {
-    // ── Set in Inspector ──────────────────────────────────────────
-    // 0 = Player 1 (uses WASD + Space)
-    // 1 = Player 2 (uses Arrow Keys + Enter)
-    public int playerIndex = 0;
-
+    [Header("Movement")]
     public float moveSpeed = 5f;
+    public float gravity = -9.8f;
 
-    // ── Reference to THIS player's NetworkManager ──────────────────
-    public NetworkManager networkManager;
+    [Header("Camera")]
+    public float cameraHeight = 8f;   // How high the camera is above player
+    public float cameraDistance = 5f;   // How far behind the player
 
-    // ── Internal state ─────────────────────────────────────────────
-    float sendTimer = 0f;
-    float sendInterval = 0.05f;   // send position 20x per second
-    Vector3 lastSentPos;
-    float lastSentRotY;
+    // ── Internal ──────────────────────────────────────────────
+    private CharacterController cc;
+    private Camera mainCam;
+    private Vector3 velocity;        // for gravity
+    private float sendTimer = 0f;
+    private const float SEND_INTERVAL = 0.05f;  // 50ms = 20 updates/sec
 
-    bool gameActive = false;   // only send data after game starts
+    private Vector3 lastSentPos;
+    private float lastSentRot;
 
-    public void SetGameActive(bool active)
+    // ─────────────────────────────────────────────────────────
+    void Awake()
     {
-        gameActive = active;
+        cc = GetComponent<CharacterController>();
+        mainCam = Camera.main;
     }
 
     void Update()
     {
-        if (!gameActive) return;
-        if (networkManager == null || !networkManager.connected) return;
-
         HandleMovement();
-        HandleAttack();
-        HandlePositionSync();
+       // HandleCameraFollow();
+        HandleNetworkSend();
     }
 
+    // ─────────────────────────────────────────────────────────
+    //  MOVEMENT
+    // ─────────────────────────────────────────────────────────
     void HandleMovement()
     {
-        float h = 0f;
-        float v = 0f;
+        float h = Input.GetAxis("Horizontal");  // A/D or ←/→
+        float v = Input.GetAxis("Vertical");    // W/S or ↑/↓
 
-        if (playerIndex == 0)
+        // Move relative to world axes (top-down style)
+        Vector3 moveDir = new Vector3(h, 0f, v).normalized;
+
+        if (moveDir.magnitude > 0.1f)
         {
-            // Player 1: WASD
-            if (Input.GetKey(KeyCode.W)) v = 1f;
-            if (Input.GetKey(KeyCode.S)) v = -1f;
-            if (Input.GetKey(KeyCode.A)) h = -1f;
-            if (Input.GetKey(KeyCode.D)) h = 1f;
-        }
-        else
-        {
-            // Player 2: Arrow Keys
-            if (Input.GetKey(KeyCode.UpArrow)) v = 1f;
-            if (Input.GetKey(KeyCode.DownArrow)) v = -1f;
-            if (Input.GetKey(KeyCode.LeftArrow)) h = -1f;
-            if (Input.GetKey(KeyCode.RightArrow)) h = 1f;
+            // Rotate to face movement direction
+            float targetAngle = Mathf.Atan2(moveDir.x, moveDir.z) * Mathf.Rad2Deg;
+            transform.rotation = Quaternion.Euler(0f, targetAngle, 0f);
+
+            cc.Move(moveDir * moveSpeed * Time.deltaTime);
         }
 
-        Vector3 dir = new Vector3(h, 0f, v).normalized;
-
-        if (dir.magnitude > 0.01f)
-        {
-            transform.Translate(dir * moveSpeed * Time.deltaTime, Space.World);
-            transform.rotation = Quaternion.LookRotation(dir);
-        }
-
-        // Keep player on the ground plane (y stays at 1)
-        Vector3 pos = transform.position;
-        pos.y = 1f;
-        transform.position = pos;
+        // Simple gravity
+        if (cc.isGrounded) velocity.y = -0.5f;
+        else velocity.y += gravity * Time.deltaTime;
+        cc.Move(velocity * Time.deltaTime);
     }
 
-    void HandleAttack()
+    // ─────────────────────────────────────────────────────────
+    //  CAMERA — follows player from above/behind (isometric-ish)
+    // ─────────────────────────────────────────────────────────
+    void HandleCameraFollow()
     {
-        bool attacked = false;
+        if (mainCam == null) return;
 
-        if (playerIndex == 0 && Input.GetKeyDown(KeyCode.Space))
-            attacked = true;
+        Vector3 desiredPos = transform.position
+                           + Vector3.up * cameraHeight
+                           - transform.forward * cameraDistance;
 
-        if (playerIndex == 1 && (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter)))
-            attacked = true;
+        mainCam.transform.position = Vector3.Lerp(
+            mainCam.transform.position, desiredPos, Time.deltaTime * 8f);
 
-        if (attacked)
-        {
-            networkManager.SendAttack();
-            // Flash the capsule briefly to show attack visually
-            StartCoroutine(FlashAttack());
-        }
+        mainCam.transform.LookAt(transform.position + Vector3.up * 1f);
     }
 
-    System.Collections.IEnumerator FlashAttack()
-    {
-        var rend = GetComponent<Renderer>();
-        if (rend == null) yield break;
-
-        Color original = rend.material.color;
-        rend.material.color = Color.yellow;
-        yield return new WaitForSeconds(0.15f);
-        rend.material.color = original;
-    }
-
-    void HandlePositionSync()
+    // ─────────────────────────────────────────────────────────
+    //  NETWORK SEND — throttled to 20/sec
+    // ─────────────────────────────────────────────────────────
+    void HandleNetworkSend()
     {
         sendTimer += Time.deltaTime;
-        if (sendTimer < sendInterval) return;
+        if (sendTimer < SEND_INTERVAL) return;
         sendTimer = 0f;
 
-        // Only send if actually moved
-        if (transform.position == lastSentPos &&
-            transform.eulerAngles.y == lastSentRotY)
+        Vector3 pos = transform.position;
+        float rotY = transform.eulerAngles.y;
+
+        // Only send if we actually moved (saves bandwidth)
+        if (Vector3.Distance(pos, lastSentPos) < 0.001f &&
+            Mathf.Abs(rotY - lastSentRot) < 0.1f)
             return;
 
-        lastSentPos = transform.position;
-        lastSentRotY = transform.eulerAngles.y;
+        lastSentPos = pos;
+        lastSentRot = rotY;
 
-        networkManager.SendMove(transform.position, transform.eulerAngles.y);
+        NetworkManager.Instance.SendMove(pos, rotY);
     }
 }

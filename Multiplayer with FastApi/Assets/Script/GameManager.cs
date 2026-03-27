@@ -1,228 +1,270 @@
-﻿// GameManager.cs
-// ONE instance per player.
-// GameManager1 handles messages for Player 1.
-// GameManager2 handles messages for Player 2.
-//
-// Attach to an empty GameObject. Wire up references in Inspector.
+﻿/*
+ * GameManager.cs
+ * ──────────────
+ * Controls:
+ *   - All UI panels (Main Menu, Lobby, Game)
+ *   - Spawning local + remote player capsules
+ *   - Listening to NetworkManager events
+ *
+ * SETUP IN UNITY:
+ *   1. Create empty GameObject → "GameManager" → attach this script
+ *   2. Build the UI (see UI SETUP below) and wire references in Inspector
+ *   3. Create two prefabs: PlayerPrefab (blue) and RemotePlayerPrefab (red)
+ */
 
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
+using TMPro;  // if using TextMeshPro; swap to Text if using legacy UI
 
 public class GameManager : MonoBehaviour
 {
-    // ── Set in Inspector ──────────────────────────────────────────
-    public int playerIndex = 0;   // 0 = Player1's GM,  1 = Player2's GM
+    public static GameManager Instance;
 
-    [Header("This player's objects")]
-    public PlayerController myPlayerController;   // LocalPlayer1 or LocalPlayer2
-    public Transform remotePlayerTransform; // the OTHER player's capsule
+    // ── Inspector References — drag GameObjects here ──────────
+    [Header("UI Panels")]
+    public GameObject panelMain;     // Main menu: Create / Join buttons
+    public GameObject panelLobby;    // After create: shows room ID + waiting
+    public GameObject panelJoin;     // Join room: input field + join button
+    public GameObject panelGame;     // In-game HUD (empty or minimal)
 
-    [Header("This player's UI")]
-    public Text statusText;   // shows game status
-    public Text scoreText;    // shows scores
-    public Text controlsText; // shows control hint
+    [Header("Main Panel UI")]
+    public Button btnCreateRoom;
+    public Button btnGoToJoin;
 
-    // ── Internal state ─────────────────────────────────────────────
-    string myID = "";
-    int myScore = 0;
-    int theirScore = 0;
+    [Header("Lobby Panel UI")]
+    public TMP_Text txtRoomId;        // Shows "Room: ABCD12"
+    public TMP_Text txtWaiting;       // "Waiting for player..." or "Player 2 joined!"
+    public Button btnStartGame;     // Only visible to host after P2 joins
+    public TMP_Text txtMyPlayerId;    // Shows your player ID (optional debug info)
+
+    [Header("Join Panel UI")]
+    public TMP_InputField inputRoomId;  // Player types room ID here
+    public Button btnJoinRoom;
+    public Button btnBackToMain;
+    public TMP_Text txtJoinStatus; // Error messages
+
+    [Header("Player Prefabs")]
+    public GameObject localPlayerPrefab;   // Blue capsule
+    public GameObject remotePlayerPrefab;  // Red capsule
+
+    // ── Internal state ─────────────────────────────────────────
+    private GameObject localPlayerObj;
+    private Dictionary<string, GameObject> remotePlayers = new Dictionary<string, GameObject>();
+    private string hostId;
+
+    // ─────────────────────────────────────────────────────────
+    void Awake()
+    {
+        if (Instance != null) { Destroy(gameObject); return; }
+        Instance = this;
+    }
 
     void Start()
     {
-        // Show the correct controls hint
-        if (controlsText != null)
+        ShowPanel(panelMain);
+        btnStartGame.gameObject.SetActive(false);
+
+        // Wire buttons
+        btnCreateRoom.onClick.AddListener(OnClickCreate);
+        btnGoToJoin.onClick.AddListener(() => ShowPanel(panelJoin));
+        btnJoinRoom.onClick.AddListener(OnClickJoin);
+        btnBackToMain.onClick.AddListener(() => ShowPanel(panelMain));
+        btnStartGame.onClick.AddListener(OnClickStart);
+
+        // Subscribe to network events
+        var net = NetworkManager.Instance;
+        net.OnRoomCreated += HandleRoomCreated;
+        net.OnJoinedRoom += HandleJoinedRoom;
+        net.OnOtherPlayerJoined += HandleOtherPlayerJoined;
+        net.OnGameStarted += HandleGameStarted;
+        net.OnPlayerMoved += HandlePlayerMoved;
+        net.OnPlayerLeft += HandlePlayerLeft;
+        net.OnError += HandleError;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  BUTTON HANDLERS
+    // ─────────────────────────────────────────────────────────
+
+    void OnClickCreate()
+    {
+        NetworkManager.Instance.CreateRoom();
+        txtWaiting.text = "Creating room...";
+        ShowPanel(panelLobby);
+        btnStartGame.gameObject.SetActive(false);
+    }
+
+    void OnClickJoin()
+    {
+        string roomId = inputRoomId.text.Trim().ToUpper();
+        if (string.IsNullOrEmpty(roomId))
         {
-            if (playerIndex == 0)
-                controlsText.text = "P1: WASD move | Space attack";
+            txtJoinStatus.text = "Please enter a room ID";
+            return;
+        }
+        txtJoinStatus.text = "Joining...";
+        NetworkManager.Instance.JoinRoom(roomId);
+    }
+
+    void OnClickStart()
+    {
+        NetworkManager.Instance.StartGame();
+    }
+
+    // ─────────────────────────────────────────────────────────
+    //  NETWORK EVENT HANDLERS
+    // ─────────────────────────────────────────────────────────
+
+    // Server confirmed room was created
+    void HandleRoomCreated(string roomId)
+    {
+        txtRoomId.text = $"Room ID:  {roomId}";
+        txtWaiting.text = "Waiting for second player...";
+        txtMyPlayerId.text = $"You: {NetworkManager.Instance.MyPlayerId}";
+        btnStartGame.gameObject.SetActive(false);
+        ShowPanel(panelLobby);
+    }
+
+    // Server confirmed we joined a room
+    void HandleJoinedRoom(string roomId, string myId, List<string> players)
+    {
+        txtRoomId.text = $"Room ID:  {roomId}";
+        txtWaiting.text = "Joined! Waiting for host to start...";
+        txtMyPlayerId.text = $"You: {myId}";
+        btnStartGame.gameObject.SetActive(false);  // joiner never sees start button
+        ShowPanel(panelLobby);
+    }
+
+    // Second player arrived (host sees this)
+    void HandleOtherPlayerJoined(string playerId)
+    {
+        txtWaiting.text = $"Player 2 connected!\nReady to start.";
+
+        // Show start button ONLY to the host
+        if (NetworkManager.Instance.IsHost)
+            btnStartGame.gameObject.SetActive(true);
+    }
+
+    // Game started — hide all UI, spawn players
+    void HandleGameStarted(string hostPlayerId, List<string> players, Dictionary<string, Vector3> spawns)
+    {
+        hostId = hostPlayerId;
+
+        // Hide ALL UI panels
+        panelMain.SetActive(false);
+        panelLobby.SetActive(false);
+        panelJoin.SetActive(false);
+        panelGame.SetActive(true);  // minimal HUD (can be empty)
+
+        string myId = NetworkManager.Instance.MyPlayerId;
+
+        // Spawn players
+        foreach (string pid in players)
+        {
+            Vector3 spawnPos = spawns.ContainsKey(pid) ? spawns[pid] : Vector3.zero;
+
+            if (pid == myId)
+            {
+                // Spawn LOCAL player (blue)
+                localPlayerObj = Instantiate(localPlayerPrefab, spawnPos, Quaternion.identity);
+                localPlayerObj.name = "LocalPlayer";
+                localPlayerObj.GetComponent<PlayerController>().enabled = true;
+            }
             else
-                controlsText.text = "P2: Arrows move | Enter attack";
+            {
+                // Spawn REMOTE player (red)
+                var remoteObj = Instantiate(remotePlayerPrefab, spawnPos, Quaternion.identity);
+                remoteObj.name = $"RemotePlayer_{pid}";
+                remotePlayers[pid] = remoteObj;
+            }
         }
-
-        SetStatus("Enter details and click Connect");
-        UpdateScoreDisplay();
     }
 
-    // ── Called by NetworkManager when a message arrives ────────────
-    public void HandleServerMessage(string json)
+    // Move a remote player's capsule
+    void HandlePlayerMoved(string playerId, Vector3 pos, float rotY)
     {
-        // We manually check what type of message it is
-        // and act accordingly. No external JSON library needed.
-
-        string type = ExtractString(json, "\"type\":\"", "\"");
-
-        switch (type)
+        if (remotePlayers.ContainsKey(playerId))
         {
-            case "game_start":
-                myID = ExtractString(json, "\"your_id\":\"", "\"");
-                myScore = 0;
-                theirScore = 0;
-                UpdateScoreDisplay();
-                SetStatus("GAME ON! First to 5 hits wins!");
-                // Tell PlayerController it can start
-                if (myPlayerController != null)
-                    myPlayerController.SetGameActive(true);
-                break;
-
-            case "player_joined":
-                string count = ExtractString(json, "\"count\":", ",");
-                if (count == "") count = ExtractString(json, "\"count\":", "}");
-                if (count.Trim() == "1")
-                    SetStatus("Waiting for second player...");
-                else
-                    SetStatus("Both players joined!");
-                break;
-
-            case "player_moved":
-                // Move the remote player's capsule
-                float x = ExtractFloat(json, "\"x\":");
-                float y = ExtractFloat(json, "\"y\":");
-                float z = ExtractFloat(json, "\"z\":");
-                float ry = ExtractFloat(json, "\"rotation\":{\"y\":");
-
-                if (remotePlayerTransform != null)
-                {
-                    // Smooth interpolation so movement doesn't look jerky
-                    remotePlayerTransform.position = Vector3.Lerp(
-                        remotePlayerTransform.position,
-                        new Vector3(x, y, z),
-                        0.6f
-                    );
-                    remotePlayerTransform.rotation = Quaternion.Lerp(
-                        remotePlayerTransform.rotation,
-                        Quaternion.Euler(0, ry, 0),
-                        0.6f
-                    );
-                }
-                break;
-
-            case "hit":
-                string attacker = ExtractString(json, "\"attacker\":\"", "\"");
-                string victim = ExtractString(json, "\"victim\":\"", "\"");
-
-                if (attacker == myID)
-                {
-                    myScore++;
-                    SetStatus("YOUR HIT! +" + myScore);
-                    FlashStatus(Color.green);
-                }
-                else if (victim == myID)
-                {
-                    theirScore++;
-                    SetStatus("Got hit! Dodge!");
-                    FlashStatus(Color.red);
-                }
-
-                UpdateScoreDisplay();
-                break;
-
-            case "miss":
-                float dist = ExtractFloat(json, "\"dist\":");
-                SetStatus($"Miss! Too far ({dist:F1} units). Get closer!");
-                break;
-
-            case "game_over":
-                string winner = ExtractString(json, "\"winner\":\"", "\"");
-                if (winner == myID)
-                    SetStatus("=== YOU WIN! === Press R to restart");
-                else
-                    SetStatus("=== You lose === Press R to restart");
-
-                if (myPlayerController != null)
-                    myPlayerController.SetGameActive(false);
-                break;
-
-            case "game_restart":
-                myScore = 0;
-                theirScore = 0;
-                UpdateScoreDisplay();
-                SetStatus("RESTARTED! WASD move, Space/Enter attack");
-                if (myPlayerController != null)
-                    myPlayerController.SetGameActive(true);
-                break;
-
-            case "player_left":
-                SetStatus("Other player left the game.");
-                if (myPlayerController != null)
-                    myPlayerController.SetGameActive(false);
-                break;
-
-            case "error":
-                string errMsg = ExtractString(json, "\"msg\":\"", "\"");
-                SetStatus("Error: " + errMsg);
-                break;
-
-            default:
-                Debug.Log($"[GM{playerIndex}] Unknown message type: {type}");
-                break;
+            var remote = remotePlayers[playerId].GetComponent<RemotePlayer>();
+            remote.SetTarget(pos, rotY);
         }
     }
 
-    // ── Restart key ────────────────────────────────────────────────
-    void Update()
+    // Remove a player who disconnected
+    void HandlePlayerLeft(string playerId)
     {
-        // Player 1 presses R to request restart
-        if (playerIndex == 0 && Input.GetKeyDown(KeyCode.R))
+        if (remotePlayers.ContainsKey(playerId))
         {
-            if (NetworkManager.Player1 != null)
-                NetworkManager.Player1.SendRestart();
+            Destroy(remotePlayers[playerId]);
+            remotePlayers.Remove(playerId);
         }
+        // Show a reconnect screen or just log
+        Debug.Log($"[GAME] Player {playerId} left the game");
     }
 
-    // ── UI helpers ─────────────────────────────────────────────────
-    void SetStatus(string msg)
+    void HandleError(string message)
     {
-        if (statusText != null)
-            statusText.text = msg;
-        Debug.Log($"[GM{playerIndex}] {msg}");
+        // Show error on whichever panel is active
+        txtJoinStatus.text = $"Error: {message}";
+        Debug.LogWarning($"[GAME] Server error: {message}");
     }
 
-    void UpdateScoreDisplay()
+    // ─────────────────────────────────────────────────────────
+    //  UI HELPER
+    // ─────────────────────────────────────────────────────────
+    void ShowPanel(GameObject panel)
     {
-        if (scoreText != null)
-            scoreText.text = $"You: {myScore}  |  Them: {theirScore}";
-    }
-
-    Coroutine flashCoroutine;
-    void FlashStatus(Color col)
-    {
-        if (statusText == null) return;
-        if (flashCoroutine != null) StopCoroutine(flashCoroutine);
-        flashCoroutine = StartCoroutine(DoFlash(col));
-    }
-
-    System.Collections.IEnumerator DoFlash(Color col)
-    {
-        statusText.color = col;
-        yield return new WaitForSeconds(0.4f);
-        statusText.color = Color.white;
-    }
-
-    // ── JSON helpers ───────────────────────────────────────────────
-    // Extracts a string value from JSON: finds key, reads until endChar
-    string ExtractString(string json, string key, string endChar)
-    {
-        int i = json.IndexOf(key);
-        if (i < 0) return "";
-        int start = i + key.Length;
-        int end = json.IndexOf(endChar, start);
-        if (end < 0) return json.Substring(start);
-        return json.Substring(start, end - start);
-    }
-
-    // Extracts a float value from JSON: finds key, reads numeric chars
-    float ExtractFloat(string json, string key)
-    {
-        int i = json.IndexOf(key);
-        if (i < 0) return 0f;
-        int s = i + key.Length;
-        int e = s;
-        while (e < json.Length &&
-               (char.IsDigit(json[e]) || json[e] == '.' || json[e] == '-'))
-            e++;
-        return float.TryParse(
-            json.Substring(s, e - s),
-            System.Globalization.NumberStyles.Float,
-            System.Globalization.CultureInfo.InvariantCulture,
-            out float v) ? v : 0f;
+        panelMain.SetActive(false);
+        panelLobby.SetActive(false);
+        panelJoin.SetActive(false);
+        // panelGame stays controlled by game state
+        panel.SetActive(true);
     }
 }
+
+/*
+ ═══════════════════════════════════════════════════════════
+  UI SETUP IN UNITY (build this in Canvas)
+ ═══════════════════════════════════════════════════════════
+
+  Canvas
+  ├── PanelMain
+  │   ├── Text "Local WiFi Multiplayer"
+  │   ├── Button "Create Room"   → btnCreateRoom
+  │   └── Button "Join Room"     → btnGoToJoin
+  │
+  ├── PanelLobby
+  │   ├── Text (Room ID)         → txtRoomId
+  │   ├── Text (waiting msg)     → txtWaiting
+  │   ├── Text (your ID)         → txtMyPlayerId
+  │   └── Button "Start Game"    → btnStartGame  (hidden by default)
+  │
+  ├── PanelJoin
+  │   ├── InputField             → inputRoomId
+  │   ├── Button "Join"          → btnJoinRoom
+  │   ├── Button "Back"          → btnBackToMain
+  │   └── Text (status/error)    → txtJoinStatus
+  │
+  └── PanelGame  (empty HUD panel, active during gameplay)
+
+ ═══════════════════════════════════════════════════════════
+  PLAYER PREFAB SETUP
+ ═══════════════════════════════════════════════════════════
+
+  LocalPlayerPrefab:
+    - 3D Object → Capsule
+    - Material: Blue
+    - Add PlayerController.cs
+    - Add CharacterController component
+    - Tag: "LocalPlayer"
+
+  RemotePlayerPrefab:
+    - 3D Object → Capsule
+    - Material: Red
+    - Add RemotePlayer.cs
+    - NO CharacterController (server drives position)
+    - Tag: "RemotePlayer"
+
+ ═══════════════════════════════════════════════════════════
+*/
