@@ -1,59 +1,91 @@
 ﻿/*
- * GameManager.cs
- * ──────────────
- * Controls:
- *   - All UI panels (Main Menu, Lobby, Game)
- *   - Spawning local + remote player capsules
- *   - Listening to NetworkManager events
- *
- * SETUP IN UNITY:
- *   1. Create empty GameObject → "GameManager" → attach this script
- *   2. Build the UI (see UI SETUP below) and wire references in Inspector
- *   3. Create two prefabs: PlayerPrefab (blue) and RemotePlayerPrefab (red)
+ * GameManager.cs  (v2 — with HUD, Hit Detection, Scores, Health, Kill Feed)
+ * ───────────────────────────────────────────────────────────────────────────
+ * WHAT'S NEW:
+ *   - PanelGame starts INACTIVE (no more button blocking)
+ *   - Camera NOT touched — you place it yourself in scene
+ *   - Space bar = Attack (server-authoritative hit detection)
+ *   - Score, Health, Kill Feed, End Game flow
+ *   - PanelGameOver with Play Again / Home
  */
 
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
-using TMPro;  // if using TextMeshPro; swap to Text if using legacy UI
+using TMPro;
 
 public class GameManager : MonoBehaviour
 {
     public static GameManager Instance;
 
-    // ── Inspector References — drag GameObjects here ──────────
-    [Header("UI Panels")]
-    public GameObject panelMain;     // Main menu: Create / Join buttons
-    public GameObject panelLobby;    // After create: shows room ID + waiting
-    public GameObject panelJoin;     // Join room: input field + join button
-    public GameObject panelGame;     // In-game HUD (empty or minimal)
+    // ═══════════════════════════════════════════════════════════
+    //  INSPECTOR REFERENCES
+    // ═══════════════════════════════════════════════════════════
 
-    [Header("Main Panel UI")]
+    [Header("── Panels ──")]
+    public GameObject panelMain;
+    public GameObject panelLobby;
+    public GameObject panelJoin;
+    public GameObject panelGame;      // MUST BE INACTIVE in Inspector
+    public GameObject panelGameOver;  // MUST BE INACTIVE in Inspector
+
+    [Header("── PanelMain ──")]
     public Button btnCreateRoom;
     public Button btnGoToJoin;
 
-    [Header("Lobby Panel UI")]
-    public TMP_Text txtRoomId;        // Shows "Room: ABCD12"
-    public TMP_Text txtWaiting;       // "Waiting for player..." or "Player 2 joined!"
-    public Button btnStartGame;     // Only visible to host after P2 joins
-    public TMP_Text txtMyPlayerId;    // Shows your player ID (optional debug info)
+    [Header("── PanelLobby ──")]
+    public TMP_Text txtRoomId;
+    public TMP_Text txtWaiting;
+    public TMP_Text txtMyPlayerId;
+    public Button btnStartGame;     // hidden until P2 joins
 
-    [Header("Join Panel UI")]
-    public TMP_InputField inputRoomId;  // Player types room ID here
+    [Header("── PanelJoin ──")]
+    public TMP_InputField inputRoomId;
     public Button btnJoinRoom;
     public Button btnBackToMain;
-    public TMP_Text txtJoinStatus; // Error messages
+    public TMP_Text txtJoinStatus;
 
-    [Header("Player Prefabs")]
-    public GameObject localPlayerPrefab;   // Blue capsule
-    public GameObject remotePlayerPrefab;  // Red capsule
+    [Header("── PanelGame HUD ──")]
+    public TMP_Text txtMyScore;
+    public TMP_Text txtEnemyScore;
+    public TMP_Text txtMyHealth;
+    public TMP_Text txtEnemyHealth;
+    public TMP_Text txtKillFeed;
+    public Button btnAttack;
+    public Button btnEndGame;       // hidden by default
 
-    // ── Internal state ─────────────────────────────────────────
+    [Header("── PanelGameOver ──")]
+    public TMP_Text txtGameOverTitle;
+    public Button btnPlayAgain;
+
+    [Header("── Prefabs ──")]
+    public GameObject localPlayerPrefab;
+    public GameObject remotePlayerPrefab;
+
+    // ═══════════════════════════════════════════════════════════
+    //  GAME STATE
+    // ═══════════════════════════════════════════════════════════
+
     private GameObject localPlayerObj;
     private Dictionary<string, GameObject> remotePlayers = new Dictionary<string, GameObject>();
-    private string hostId;
 
-    // ─────────────────────────────────────────────────────────
+    private int myScore = 0;
+    private int enemyScore = 0;
+    private int myHealth = 100;
+    private int enemyHealth = 100;
+
+    private const int MAX_SCORE = 5;    // first to 5 kills wins
+    private const int HIT_DAMAGE = 25;   // each hit = 25 damage
+    private const float ATTACK_RANGE = 3f;
+
+    private bool gameActive = false;
+    private Coroutine killFeedCoroutine;
+
+    // ═══════════════════════════════════════════════════════════
+    //  INIT
+    // ═══════════════════════════════════════════════════════════
+
     void Awake()
     {
         if (Instance != null) { Destroy(gameObject); return; }
@@ -62,17 +94,25 @@ public class GameManager : MonoBehaviour
 
     void Start()
     {
-        ShowPanel(panelMain);
+        // Make sure game panels are off
+        panelGame.SetActive(false);
+        panelGameOver.SetActive(false);
         btnStartGame.gameObject.SetActive(false);
+        btnEndGame.gameObject.SetActive(false);
 
-        // Wire buttons
+        ShowPanel(panelMain);
+
+        // Button listeners
         btnCreateRoom.onClick.AddListener(OnClickCreate);
         btnGoToJoin.onClick.AddListener(() => ShowPanel(panelJoin));
         btnJoinRoom.onClick.AddListener(OnClickJoin);
         btnBackToMain.onClick.AddListener(() => ShowPanel(panelMain));
         btnStartGame.onClick.AddListener(OnClickStart);
+        btnAttack.onClick.AddListener(OnClickAttack);
+        btnEndGame.onClick.AddListener(OnClickEndGame);
+        btnPlayAgain.onClick.AddListener(OnClickPlayAgain);
 
-        // Subscribe to network events
+        // Network events
         var net = NetworkManager.Instance;
         net.OnRoomCreated += HandleRoomCreated;
         net.OnJoinedRoom += HandleJoinedRoom;
@@ -80,31 +120,38 @@ public class GameManager : MonoBehaviour
         net.OnGameStarted += HandleGameStarted;
         net.OnPlayerMoved += HandlePlayerMoved;
         net.OnPlayerLeft += HandlePlayerLeft;
+        net.OnHit += HandleHit;
+        net.OnGameOver += HandleGameOver;
         net.OnError += HandleError;
     }
 
-    // ─────────────────────────────────────────────────────────
+    void Update()
+    {
+        if (!gameActive) return;
+
+        // Space bar = attack (keyboard shortcut in addition to button)
+        if (Input.GetKeyDown(KeyCode.Space))
+            OnClickAttack();
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  BUTTON HANDLERS
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
 
     void OnClickCreate()
     {
-        NetworkManager.Instance.CreateRoom();
         txtWaiting.text = "Creating room...";
         ShowPanel(panelLobby);
         btnStartGame.gameObject.SetActive(false);
+        NetworkManager.Instance.CreateRoom();
     }
 
     void OnClickJoin()
     {
-        string roomId = inputRoomId.text.Trim().ToUpper();
-        if (string.IsNullOrEmpty(roomId))
-        {
-            txtJoinStatus.text = "Please enter a room ID";
-            return;
-        }
+        string id = inputRoomId.text.Trim().ToUpper();
+        if (string.IsNullOrEmpty(id)) { txtJoinStatus.text = "Enter a room ID"; return; }
         txtJoinStatus.text = "Joining...";
-        NetworkManager.Instance.JoinRoom(roomId);
+        NetworkManager.Instance.JoinRoom(id);
     }
 
     void OnClickStart()
@@ -112,52 +159,81 @@ public class GameManager : MonoBehaviour
         NetworkManager.Instance.StartGame();
     }
 
-    // ─────────────────────────────────────────────────────────
-    //  NETWORK EVENT HANDLERS
-    // ─────────────────────────────────────────────────────────
+    void OnClickAttack()
+    {
+        if (!gameActive || localPlayerObj == null) return;
+        NetworkManager.Instance.SendAttack();
+        // Small visual flash on button
+        StartCoroutine(FlashAttackButton());
+    }
 
-    // Server confirmed room was created
+    void OnClickEndGame()
+    {
+        // Only host can force-end
+        if (NetworkManager.Instance.IsHost)
+            NetworkManager.Instance.SendEndGame();
+    }
+
+    void OnClickPlayAgain()
+    {
+        // Reset everything and go back to main menu
+        ResetGameState();
+        panelGameOver.SetActive(false);
+        ShowPanel(panelMain);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  NETWORK EVENT HANDLERS
+    // ═══════════════════════════════════════════════════════════
+
     void HandleRoomCreated(string roomId)
     {
-        txtRoomId.text = $"Room ID:  {roomId}";
+        txtRoomId.text = $"Room ID:  <b>{roomId}</b>";
         txtWaiting.text = "Waiting for second player...";
         txtMyPlayerId.text = $"You: {NetworkManager.Instance.MyPlayerId}";
         btnStartGame.gameObject.SetActive(false);
         ShowPanel(panelLobby);
     }
 
-    // Server confirmed we joined a room
     void HandleJoinedRoom(string roomId, string myId, List<string> players)
     {
-        txtRoomId.text = $"Room ID:  {roomId}";
+        txtRoomId.text = $"Room ID:  <b>{roomId}</b>";
         txtWaiting.text = "Joined! Waiting for host to start...";
         txtMyPlayerId.text = $"You: {myId}";
-        btnStartGame.gameObject.SetActive(false);  // joiner never sees start button
+        btnStartGame.gameObject.SetActive(false);
         ShowPanel(panelLobby);
     }
 
-    // Second player arrived (host sees this)
     void HandleOtherPlayerJoined(string playerId)
     {
-        txtWaiting.text = $"Player 2 connected!\nReady to start.";
-
-        // Show start button ONLY to the host
+        txtWaiting.text = $"<color=#00ff88>Player 2 connected!</color>\nReady to start.";
         if (NetworkManager.Instance.IsHost)
             btnStartGame.gameObject.SetActive(true);
     }
 
-    // Game started — hide all UI, spawn players
-    void HandleGameStarted(string hostPlayerId, List<string> players, Dictionary<string, Vector3> spawns)
+    void HandleGameStarted(string hostId, List<string> players, Dictionary<string, Vector3> spawns)
     {
-        hostId = hostPlayerId;
-
-        // Hide ALL UI panels
+        // Hide ALL menus
         panelMain.SetActive(false);
         panelLobby.SetActive(false);
         panelJoin.SetActive(false);
-        panelGame.SetActive(true);  // minimal HUD (can be empty)
+        panelGameOver.SetActive(false);
+
+        // Show HUD
+        panelGame.SetActive(true);
+
+        // Host gets end game button
+        btnEndGame.gameObject.SetActive(NetworkManager.Instance.IsHost);
+
+        ResetGameState();
+        gameActive = true;
 
         string myId = NetworkManager.Instance.MyPlayerId;
+
+        // Destroy old player objects if any (play again case)
+        if (localPlayerObj != null) Destroy(localPlayerObj);
+        foreach (var kv in remotePlayers) Destroy(kv.Value);
+        remotePlayers.Clear();
 
         // Spawn players
         foreach (string pid in players)
@@ -166,32 +242,29 @@ public class GameManager : MonoBehaviour
 
             if (pid == myId)
             {
-                // Spawn LOCAL player (blue)
                 localPlayerObj = Instantiate(localPlayerPrefab, spawnPos, Quaternion.identity);
                 localPlayerObj.name = "LocalPlayer";
-                localPlayerObj.GetComponent<PlayerController>().enabled = true;
+                var pc = localPlayerObj.GetComponent<PlayerController>();
+                if (pc != null) pc.enabled = true;
             }
             else
             {
-                // Spawn REMOTE player (red)
                 var remoteObj = Instantiate(remotePlayerPrefab, spawnPos, Quaternion.identity);
                 remoteObj.name = $"RemotePlayer_{pid}";
                 remotePlayers[pid] = remoteObj;
             }
         }
+
+        UpdateHUD();
+        ShowKillFeed("<color=#ffff00>⚔ GAME STARTED — FIGHT!</color>", 3f);
     }
 
-    // Move a remote player's capsule
     void HandlePlayerMoved(string playerId, Vector3 pos, float rotY)
     {
         if (remotePlayers.ContainsKey(playerId))
-        {
-            var remote = remotePlayers[playerId].GetComponent<RemotePlayer>();
-            remote.SetTarget(pos, rotY);
-        }
+            remotePlayers[playerId].GetComponent<RemotePlayer>().SetTarget(pos, rotY);
     }
 
-    // Remove a player who disconnected
     void HandlePlayerLeft(string playerId)
     {
         if (remotePlayers.ContainsKey(playerId))
@@ -199,72 +272,169 @@ public class GameManager : MonoBehaviour
             Destroy(remotePlayers[playerId]);
             remotePlayers.Remove(playerId);
         }
-        // Show a reconnect screen or just log
-        Debug.Log($"[GAME] Player {playerId} left the game");
+        ShowKillFeed("<color=#ff4444>Enemy disconnected.</color>", 4f);
+        gameActive = false;
+    }
+
+    // Server says someone got hit
+    // payload: { attacker, victim, damage, victim_health, scores:{p1:x, p2:y}, killed:bool }
+    void HandleHit(string attacker, string victim, int damage, int victimHealth,
+                   Dictionary<string, int> scores, bool killed)
+    {
+        string myId = NetworkManager.Instance.MyPlayerId;
+
+        // Update health
+        if (victim == myId)
+        {
+            myHealth = victimHealth;
+            ShowKillFeed($"<color=#ff4444>You took {damage} damage!</color>", 2f);
+            StartCoroutine(FlashDamage());
+        }
+        else
+        {
+            enemyHealth = victimHealth;
+            ShowKillFeed($"<color=#00ff88>Hit! Enemy took {damage} damage!</color>", 2f);
+        }
+
+        // Update scores if someone died
+        if (killed)
+        {
+            if (victim == myId)
+            {
+                // I died — respawn with full health after 2 sec
+                myHealth = 100;
+                enemyScore++;
+                ShowKillFeed("<color=#ff4444>💀 YOU WERE KILLED</color>", 3f);
+                StartCoroutine(RespawnLocal());
+            }
+            else
+            {
+                enemyHealth = 100;
+                myScore++;
+                ShowKillFeed("<color=#00ff88>🏆 ENEMY ELIMINATED!</color>", 3f);
+            }
+        }
+
+        UpdateHUD();
+    }
+
+    void HandleGameOver(string winner, Dictionary<string, int> finalScores)
+    {
+        gameActive = false;
+        panelGame.SetActive(false);
+        panelGameOver.SetActive(true);
+
+        string myId = NetworkManager.Instance.MyPlayerId;
+        bool iWon = winner == myId;
+
+        txtGameOverTitle.text = iWon
+            ? "<color=#FFD700>🏆 YOU WIN!</color>"
+            : "<color=#FF4444>💀 YOU LOSE</color>";
+
+        // Clean up players
+        if (localPlayerObj != null) Destroy(localPlayerObj);
+        foreach (var kv in remotePlayers) Destroy(kv.Value);
+        remotePlayers.Clear();
     }
 
     void HandleError(string message)
     {
-        // Show error on whichever panel is active
-        txtJoinStatus.text = $"Error: {message}";
+        txtJoinStatus.text = $"<color=#ff4444>Error: {message}</color>";
         Debug.LogWarning($"[GAME] Server error: {message}");
     }
 
-    // ─────────────────────────────────────────────────────────
-    //  UI HELPER
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════
+    //  PUBLIC — called by PlayerController to get attack range
+    // ═══════════════════════════════════════════════════════════
+
+    public float GetAttackRange() => ATTACK_RANGE;
+
+    public Vector3 GetLocalPlayerPosition()
+    {
+        if (localPlayerObj != null) return localPlayerObj.transform.position;
+        return Vector3.zero;
+    }
+
+    public Vector3 GetRemotePlayerPosition()
+    {
+        foreach (var kv in remotePlayers)
+            return kv.Value.transform.position;
+        return Vector3.one * 9999f;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  HELPERS
+    // ═══════════════════════════════════════════════════════════
+
+    void UpdateHUD()
+    {
+        txtMyScore.text = $"Score: {myScore}";
+        txtEnemyScore.text = $"Enemy: {enemyScore}";
+        txtMyHealth.text = $"HP: {myHealth}";
+        txtEnemyHealth.text = $"Enemy HP: {enemyHealth}";
+    }
+
+    void ShowKillFeed(string message, float duration)
+    {
+        if (killFeedCoroutine != null) StopCoroutine(killFeedCoroutine);
+        killFeedCoroutine = StartCoroutine(KillFeedRoutine(message, duration));
+    }
+
+    IEnumerator KillFeedRoutine(string message, float duration)
+    {
+        txtKillFeed.text = message;
+        yield return new WaitForSeconds(duration);
+        txtKillFeed.text = "";
+    }
+
+    IEnumerator FlashAttackButton()
+    {
+        var colors = btnAttack.colors;
+        var orig = colors.normalColor;
+        colors.normalColor = Color.yellow;
+        btnAttack.colors = colors;
+        yield return new WaitForSeconds(0.15f);
+        colors.normalColor = orig;
+        btnAttack.colors = colors;
+    }
+
+    IEnumerator FlashDamage()
+    {
+        // Flash health text red briefly
+        txtMyHealth.color = Color.red;
+        yield return new WaitForSeconds(0.3f);
+        txtMyHealth.color = Color.white;
+    }
+
+    IEnumerator RespawnLocal()
+    {
+        if (localPlayerObj != null)
+        {
+            // Briefly disable movement during respawn
+            var pc = localPlayerObj.GetComponent<PlayerController>();
+            if (pc != null) pc.enabled = false;
+            yield return new WaitForSeconds(1.5f);
+            // Respawn at starting position
+            localPlayerObj.transform.position = new Vector3(-2f, 0f, 0f);
+            if (pc != null) pc.enabled = true;
+        }
+    }
+
+    void ResetGameState()
+    {
+        myScore = 0;
+        enemyScore = 0;
+        myHealth = 100;
+        enemyHealth = 100;
+        gameActive = false;
+        UpdateHUD();
+    }
+
     void ShowPanel(GameObject panel)
     {
         panelMain.SetActive(false);
         panelLobby.SetActive(false);
         panelJoin.SetActive(false);
-        // panelGame stays controlled by game state
         panel.SetActive(true);
     }
 }
-
-/*
- ═══════════════════════════════════════════════════════════
-  UI SETUP IN UNITY (build this in Canvas)
- ═══════════════════════════════════════════════════════════
-
-  Canvas
-  ├── PanelMain
-  │   ├── Text "Local WiFi Multiplayer"
-  │   ├── Button "Create Room"   → btnCreateRoom
-  │   └── Button "Join Room"     → btnGoToJoin
-  │
-  ├── PanelLobby
-  │   ├── Text (Room ID)         → txtRoomId
-  │   ├── Text (waiting msg)     → txtWaiting
-  │   ├── Text (your ID)         → txtMyPlayerId
-  │   └── Button "Start Game"    → btnStartGame  (hidden by default)
-  │
-  ├── PanelJoin
-  │   ├── InputField             → inputRoomId
-  │   ├── Button "Join"          → btnJoinRoom
-  │   ├── Button "Back"          → btnBackToMain
-  │   └── Text (status/error)    → txtJoinStatus
-  │
-  └── PanelGame  (empty HUD panel, active during gameplay)
-
- ═══════════════════════════════════════════════════════════
-  PLAYER PREFAB SETUP
- ═══════════════════════════════════════════════════════════
-
-  LocalPlayerPrefab:
-    - 3D Object → Capsule
-    - Material: Blue
-    - Add PlayerController.cs
-    - Add CharacterController component
-    - Tag: "LocalPlayer"
-
-  RemotePlayerPrefab:
-    - 3D Object → Capsule
-    - Material: Red
-    - Add RemotePlayer.cs
-    - NO CharacterController (server drives position)
-    - Tag: "RemotePlayer"
-
- ═══════════════════════════════════════════════════════════
-*/
